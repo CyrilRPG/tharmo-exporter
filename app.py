@@ -1,6 +1,5 @@
-# app.py — Streamlit + Playwright — Export tHarmo (Sujet + Corrigé)
-# Fonctionne même si "Question suivante" sort de la vue Correction vers la vue QCM :
-# on reclique automatiquement "Correction" à chaque question.
+# app.py — Streamlit + Playwright — tHarmo (Sujet + Corrigé)
+# Flux : Correction Qn -> "Question suivante" -> QCM Q(n+1) -> "Correction" -> Correction Q(n+1) -> ...
 
 import re
 import time
@@ -14,7 +13,7 @@ st.set_page_config(page_title=APP_TITLE, layout="centered")
 st.title(APP_TITLE)
 st.caption("Entrez vos identifiants tHarmo + l’ID d’épreuve. L’appli génère 2 PDF à télécharger.")
 
-# ================= UI =================
+# =============== UI ===============
 with st.form("params"):
     base = st.text_input("Base tHarmo", "https://pass.tharmo.tutotours.fr").strip().rstrip("/")
     username = st.text_input("Email / Identifiant tHarmo", value="", autocomplete="username")
@@ -26,7 +25,7 @@ with st.form("params"):
     )
     submitted = st.form_submit_button("Exporter (Sujet + Corrigé)")
 
-# ================= Utils =================
+# =============== Utils ===============
 def parse_ids(txt: str):
     out = []
     for line in (txt or "").splitlines():
@@ -68,53 +67,64 @@ def looks_like_login(page) -> bool:
 
 def dismiss_banners(page):
     try:
-        candidates = [
-            'button:has-text("Accepter")','button:has-text("J\'accepte")','button:has-text("OK")',
-            'button:has-text("D\'accord")','button:has-text("Compris")','button:has-text("Fermer")',
-            '[aria-label="Fermer"]','#didomi-notice-agree-button','button.cookie-accept',
-        ]
-        for sel in candidates:
+        for sel in [
+            'button:has-text("Accepter")',
+            'button:has-text("J\'accepte")',
+            'button:has-text("OK")',
+            'button:has-text("D\'accord")',
+            'button:has-text("Compris")',
+            'button:has-text("Fermer")',
+            '[aria-label="Fermer"]',
+            '#didomi-notice-agree-button',
+            'button.cookie-accept',
+        ]:
             if page.locator(sel).first.count() > 0:
-                try: page.locator(sel).first.click()
-                except Exception: pass
+                try:
+                    page.locator(sel).first.click()
+                except Exception:
+                    pass
+        # masque les overlays très z-index
         page.evaluate("""() => {
             for (const s of ['.cookie', '.modal', '#cookie', '.overlay', '.consent']) {
                 document.querySelectorAll(s).forEach(n => {
                     const z = parseInt(getComputedStyle(n).zIndex||'0',10);
-                    if (z >= 1000) n.style.display='none';
+                    if (z >= 1000) n.style.display = 'none';
                 });
             }
         }""")
     except Exception:
         pass
 
-def wait_for_any_selector(page, selectors, timeout_ms=None) -> bool:
-    def any_present() -> bool:
+def wait_until_correction_ready(page, hard_timeout_ms=60000) -> bool:
+    """Attends la structure clé de la vue Correction."""
+    start = time.monotonic()
+    while (time.monotonic() - start) * 1000 < hard_timeout_ms:
         dismiss_banners(page)
-        for s in selectors:
+        has_next = page.locator("#nextQuestionButton").count() > 0
+        has_item = page.locator('span.card-title', has_text=re.compile(r"^Item\s+[A-E]$", re.I)).count() > 0
+        if has_next and has_item:
+            return True
+        page.wait_for_timeout(200)
+    return False
+
+def ensure_correction_view(page, hard_timeout_ms=60000) -> bool:
+    """Si on est sur la vue QCM, reclique 'Correction' pour venir en Correction."""
+    if wait_until_correction_ready(page, 2000):
+        return True
+    # bouton Correction sur la vue QCM
+    if page.locator("#correction").count() > 0:
+        try:
+            page.locator("#correction").first.click()
+            page.wait_for_load_state("domcontentloaded")
+        except Exception:
             try:
-                loc = page.locator(s)
-                if loc.count() > 0:
-                    try:
-                        loc.first.wait_for(state="visible")
-                        return True
-                    except Exception:
-                        return True
+                page.evaluate("""() => { const a = document.querySelector('#correction'); if (a) a.click(); }""")
+                page.wait_for_load_state("domcontentloaded")
             except Exception:
                 pass
-        return False
-    if timeout_ms is None:
-        while True:
-            if any_present(): return True
-            page.wait_for_timeout(250)
-    else:
-        end = time.monotonic() + timeout_ms/1000.0
-        while time.monotonic() < end:
-            if any_present(): return True
-            page.wait_for_timeout(250)
-        return False
+    return wait_until_correction_ready(page, hard_timeout_ms)
 
-def try_login(page, base, username, password):
+def try_login(page, base, username, password) -> bool:
     page.goto(base + "/banque/qc/entrainement/", wait_until="domcontentloaded")
     dismiss_banners(page)
     if not looks_like_login(page):
@@ -123,14 +133,12 @@ def try_login(page, base, username, password):
         email_sel = 'input[type="email"], input[name*="mail" i], input[name*="user" i], input[name*="login" i]'
         pwd_sel   = 'input[type="password"]'
         btn_sel   = 'button:has-text("Connexion"), input[type="submit"], button[type="submit"]'
-
         page.locator(email_sel).first.fill(username)
         page.locator(pwd_sel).first.fill(password)
         if page.locator(btn_sel).count() > 0:
             page.locator(btn_sel).first.click()
         else:
             page.keyboard.press("Enter")
-
         page.wait_for_url(lambda u: re.search(r"(login|connexion|auth)", u, re.I) is None)
         page.wait_for_load_state("domcontentloaded")
         dismiss_banners(page)
@@ -138,199 +146,152 @@ def try_login(page, base, username, password):
     except Exception:
         return False
 
-def wait_for_correction_href(page, timeout_ms=None):
-    def find_href():
-        try:
-            return page.evaluate("""() => {
-                const byId = document.querySelector('#correction');
-                if (byId && byId.getAttribute('href'))
-                    return new URL(byId.getAttribute('href'), location.origin).toString();
-                const cand = Array.from(document.querySelectorAll('a[href]'))
-                    .find(a => /\\/banque\\/qc\\/entrainement\\/correction\\/commencer\\//.test(a.getAttribute('href')||''));
-                return cand ? new URL(cand.getAttribute('href'), location.origin).toString() : null;
-            }""")
-        except Exception:
-            return None
-    if timeout_ms is None:
-        while True:
-            href = find_href()
-            if href: return href
-            page.wait_for_timeout(200)
-    else:
-        end = time.monotonic() + timeout_ms/1000.0
-        while time.monotonic() < end:
-            href = find_href()
-            if href: return href
-            page.wait_for_timeout(200)
-        return None
-
-def in_correction_view(page) -> bool:
-    try:
-        # Correction : présence d’Items + bouton "Question suivante" dans un <footer>
-        if page.locator("#nextQuestionButton").count() > 0 and page.locator('span.card-title:has-text("Item")').count() > 0:
-            return True
-        # Titre "Epreuve 1919110" existe en haut de carte en correction
-        if page.locator(".card.card-content .card-title:has-text('Epreuve')").count() > 0:
-            return True
-    except Exception:
-        pass
-    return False
-
-def ensure_correction_view(page):
-    """Si on est en vue QCM, clique le bouton 'Correction' pour revenir en correction."""
-    if in_correction_view(page):
-        return True
-    # En vue QCM : il y a un <a id="correction" href="...">
-    if page.locator("#correction").count() > 0:
-        try:
-            page.locator("#correction").first.click()
-            page.wait_for_load_state("domcontentloaded")
-        except Exception:
-            # fallback évaluation DOM
-            try:
-                page.evaluate("""() => {
-                    const a = document.querySelector('#correction');
-                    if (a) a.click();
-                }""")
-                page.wait_for_load_state("domcontentloaded")
-            except Exception:
-                pass
-    # Attends des artefacts correction
-    wait_for_any_selector(
-        page,
-        selectors=[
-            "#nextQuestionButton",
-            'span.card-title:has-text("Item")',
-            ".card.card-content .card-title:has-text('Epreuve')",
-        ],
-        timeout_ms=10000,
-    )
-    return in_correction_view(page)
-
-def start_correction(page, base, epreuve_id):
+def start_correction(page, base, epreuve_id) -> bool:
+    """Ouvre l'épreuve puis la première page de Correction."""
     url_qcm  = f"{base}/banque/qc/entrainement/qcmparqcm/idEpreuve={epreuve_id}"
     url_corr = f"{base}/banque/qc/entrainement/correction/commencer/fin=0/id={epreuve_id}"
-
     page.goto(url_qcm, wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
     dismiss_banners(page)
-
-    href = wait_for_correction_href(page, 10000) or url_corr
-    try:
-        page.goto(href, wait_until="domcontentloaded")
-        page.wait_for_load_state("networkidle")
-    except Exception:
-        pass
+    # clique Correction
+    if page.locator("#correction").count() > 0:
+        page.locator("#correction").first.click()
+        page.wait_for_load_state("domcontentloaded")
+    else:
+        page.goto(url_corr, wait_until="domcontentloaded")
     dismiss_banners(page)
     return ensure_correction_view(page)
 
-# ================== Extraction ==================
+# =============== Extraction (locators) ===============
 def extract_current(page):
-    """Extrait depuis la vue Correction UNIQUEMENT (items, verdicts, etc.)."""
-    return page.evaluate(
-        """() => {
-        // carte principale de CORRECTION
-        const root = document.querySelector(".card.card-content") || document.querySelector(".card .card-content") || document.querySelector(".card-content");
-        if (!root) return null;
+    """
+    Extrait la question courante depuis la VUE CORRECTION (items + verdicts).
+    Utilise uniquement des locators Playwright -> plus robuste.
+    """
+    if not ensure_correction_view(page):
+        return None
 
-        // titre principal
-        let mainTitle = "";
-        const titles = Array.from(root.querySelectorAll(".card-title, span.card-title"));
-        const qcmTitleEl = titles.find(t => /QCM\\s*:/.test((t.textContent||"").trim())) || titles[0];
-        mainTitle = (qcmTitleEl?.textContent||"").replace(/\\s+/g," ").trim();
+    # Carte principale (celle qui contient "QCM : ..." et les Items)
+    card = page.locator(".card.card-content").first
+    if card.count() == 0:
+        # fallback : autre structure
+        card = page.locator(".card .card-content").first
+    if card.count() == 0:
+        return None
 
-        // énoncé (il est affiché avant les items ou séparé par divider)
-        function getEnonceHTMLInCorrection() {
-            // en correction, l'énoncé n'est pas explicitement nommé "Énoncé", on le reconstruit à partir des sujets A..E si besoin
-            return "";
-        }
+    # Titre "QCM : ..."
+    title = ""
+    titles = card.locator(".card-title, span.card-title")
+    n_titles = titles.count()
+    for i in range(min(n_titles, 5)):
+        t = (titles.nth(i).text_content() or "").strip()
+        if re.search(r"^QCM\s*:", t, re.I):
+            title = t
+            break
+    if not title and n_titles > 0:
+        title = (titles.nth(0).text_content() or "").strip()
 
-        // Items A..E
-        const itemTitles = Array.from(root.querySelectorAll("span.card-title")).filter(el => /^Item\\s+[A-E]/i.test((el.textContent||"").trim()));
-        const items = itemTitles.map(span => {
-            const letter = (span.textContent||"").trim().replace(/^Item\\s+/i, "");
-            let row = span.nextElementSibling;
-            while(row && !row.matches(".row")) {
-                if (row.matches("span.card-title")) break;
-                row = row.nextElementSibling;
-            }
-            const cols = row ? Array.from(row.querySelectorAll(":scope > .col")) : [];
-            const pick = (col, label) => {
-                if (!col) return "";
-                const p = col.querySelector("p.justify, p");
-                if (!p) return col.textContent || "";
-                let html = p.innerHTML || "";
-                html = html.replace(/<span[^>]*>\\s*(Sujet|Correction|Votre r[ée]ponse)\\s*<\\/span>\\s*:\\s*/i, "");
-                html = html.replace(/<strong[^>]*>\\s*(Sujet|Correction|Votre r[ée]ponse)\\s*<\\/strong>\\s*:\\s*/i, "");
-                return html;
-            };
-            const colSujet = cols[0] || null;
-            const colCorr  = cols[1] || null;
-            const colRep   = cols[2] || null;
+    # Items A..E : chaque "Item X" suivi d'un .row avec 3 colonnes
+    items = []
+    item_titles = card.locator("span.card-title").all()
+    for span in item_titles:
+        txt = (span.text_content() or "").strip()
+        m = re.match(r"^Item\s+([A-E])$", txt, flags=re.I)
+        if not m:
+            continue
+        letter = m.group(1).upper()
+        # trouver le .row juste après
+        row = span.locator("xpath=following-sibling::*[contains(@class,'row')][1]")
+        if row.count() == 0:
+            # pas de structure attendue → ignorer prudemment
+            continue
+        cols = row.locator(":scope > .col, :scope > [class*=col-], :scope > [class*=col]").all()
+        sujet = correction = reponse = ""
+        is_true = is_false = False
 
-            const sujetHTML = pick(colSujet, "Sujet");
-            const corrHTML  = pick(colCorr, "Correction");
-            const repHTML   = pick(colRep, "Votre réponse");
+        # Col0 = Sujet
+        if len(cols) >= 1:
+            p = cols[0].locator("p.justify, p").first
+            if p.count() > 0:
+                html = p.inner_html()
+                html = re.sub(r"(?is)<\s*(span|strong)[^>]*>\s*(Sujet)\s*<\/\s*\1\s*>\s*:\s*", "", html)
+                sujet = html2txt(html)
+            else:
+                sujet = (cols[0].text_content() or "").strip()
 
-            const isTrue = !!(colCorr && colCorr.querySelector(".green-text"));
-            const isFalse= !!(colCorr && colCorr.querySelector(".red-text"));
+        # Col1 = Correction (+ Vrai/Faux)
+        if len(cols) >= 2:
+            p = cols[1].locator("p.justify, p").first
+            if p.count() > 0:
+                html = p.inner_html()
+                html = re.sub(r"(?is)<\s*(span|strong)[^>]*>\s*(Correction)\s*<\/\s*\1\s*>\s*:\s*", "", html)
+                correction = html2txt(html)
+            else:
+                correction = (cols[1].text_content() or "").strip()
+            is_true = cols[1].locator(".green-text").count() > 0
+            is_false = cols[1].locator(".red-text").count() > 0
 
-            return { letter, sujetHTML, correctionHTML: corrHTML, reponseHTML: repHTML, isTrue, isFalse };
-        });
+        # Col2 = Votre réponse
+        if len(cols) >= 3:
+            p = cols[2].locator("p.justify, p").first
+            if p.count() > 0:
+                html = p.inner_html()
+                html = re.sub(r"(?is)<\s*(span|strong)[^>]*>\s*(Votre r[ée]ponse)\s*<\/\s*\1\s*>\s*:\s*", "", html)
+                reponse = html2txt(html)
+            else:
+                reponse = (cols[2].text_content() or "").strip()
 
-        return { title: mainTitle, enonceHTML: getEnonceHTMLInCorrection(), items };
-    }"""
-    )
+        items.append({
+            "letter": letter,
+            "sujet": sujet,
+            "correction": correction,
+            "reponse": reponse,
+            "isTrue": is_true,
+            "isFalse": is_false,
+        })
 
-# ===== Empreinte multi-vues (QCM ou Correction) =====
-def _fingerprint_any_view(page) -> str:
+    if not items:
+        return None
+
+    return {"title": title, "enonceHTML": "", "items": items}
+
+# =============== Empreinte & Navigation ===============
+def fingerprint_any(page) -> str:
+    """
+    Empreinte courte (changement de question en QCM ou Correction).
+    """
     try:
-        return page.evaluate(
-            """() => {
-            // Vue CORRECTION ?
-            const corr = document.querySelector('#nextQuestionButton') && document.querySelector('span.card-title');
-            if (corr) {
-                const title = (document.querySelector('.card.card-content .card-title')?.textContent || '').trim();
-                const firstItem = (document.querySelector('span.card-title')?.textContent || '').trim();
-                const verdict = (document.querySelector('.green-text, .red-text')?.textContent || '').trim();
-                return 'CORR§' + title + '§' + firstItem + '§' + verdict;
-            }
-            // Vue QCM (question)
-            const qcmTitle = (document.querySelector('.saut-ligne .bold')?.textContent || '').trim();
-            // lignes A-E
-            const lines = Array.from(document.querySelectorAll('.retour-ligne'))
-                .slice(0,3).map(x => (x.textContent||'').trim()).join('|');
-            // compteur répondu "X/YYY questions répondues"
-            const rightCard = (document.querySelector('.panel-title + .card-panel')?.textContent||'').trim();
-            return 'QCM§' + qcmTitle + '§' + lines + '§' + rightCard;
-        }"""
-        ) or ""
+        # En correction
+        if page.locator("#nextQuestionButton").count() > 0:
+            title = (page.locator(".card.card-content .card-title").first.text_content() or "").strip()
+            first_item = (page.locator("span.card-title", has_text=re.compile(r"^Item\s+[A-E]$", re.I)).first.text_content() or "").strip()
+            return f"CORR|{title}|{first_item}"
+        # En QCM
+        qcm_title = (page.locator(".saut-ligne .bold").first.text_content() or "").strip()
+        first_line = (page.locator(".retour-ligne").first.text_content() or "").strip()
+        return f"QCM|{qcm_title}|{first_line}"
     except Exception:
-        return ""
+        return str(time.time())
 
-# ===== Navigation =====
 def go_next_and_reenter_correction(page) -> bool:
     """
-    Depuis la vue CORRECTION :
-      - clique "Question suivante" (passe en vue QCM),
-      - re-clique "Correction" pour la question suivante,
-      - attend un vrai changement d'empreinte.
-    Retourne True si on est bien sur la correction d'une nouvelle question.
+    En vue Correction :
+      1) clique "Question suivante" (passe en QCM),
+      2) clique "Correction" (revient en Correction sur la prochaine),
+      3) vérifie que l'empreinte change.
     """
-    before = _fingerprint_any_view(page)
+    before = fingerprint_any(page)
 
-    # sécurité : on est en correction ?
-    if not in_correction_view(page):
-        if not ensure_correction_view(page):
-            return False
+    if not ensure_correction_view(page):
+        return False
 
-    # scroll pour activer/afficher le bouton
+    # scroll pour révéler le bouton
     try:
         page.evaluate("() => window.scrollTo({top:document.body.scrollHeight, behavior:'instant'})")
     except Exception:
         pass
 
-    # 1) clic "Question suivante" (lien + bouton)
+    # 1) clic "Question suivante"
     clicked = False
     for sel in ["#nextQuestionButton", "a#nextQuestion", 'a:has-text("Question suivante")', 'button:has-text("Question suivante")']:
         if page.locator(sel).count() > 0:
@@ -342,36 +303,34 @@ def go_next_and_reenter_correction(page) -> bool:
             except Exception:
                 pass
     if not clicked:
-        # plus de "suivante" => fin d'épreuve
-        return False
+        return False  # fin d'épreuve
 
-    # 2) on est maintenant en VUE QCM ; re-cliquer "Correction"
+    # 2) re-entrer en Correction
     if not ensure_correction_view(page):
         return False
 
-    # 3) attendre un vrai changement d’empreinte par rapport à "before"
-    for _ in range(20):
+    # 3) attendre empreinte différente
+    for _ in range(25):
         page.wait_for_timeout(200)
         dismiss_banners(page)
-        after = _fingerprint_any_view(page)
-        if after and after != before:
+        after = fingerprint_any(page)
+        if after != before:
             return True
 
-    # Si l'empreinte n'a pas changé, tenter un reload et re-check
+    # dernier recours : reload et recheck
     try:
         page.reload(wait_until="domcontentloaded")
     except Exception:
         pass
     ensure_correction_view(page)
-    for _ in range(20):
+    for _ in range(25):
         page.wait_for_timeout(200)
-        after = _fingerprint_any_view(page)
-        if after and after != before:
+        if fingerprint_any(page) != before:
             return True
 
     return False
 
-# ====== Rendu PDF ======
+# =============== PDF ===============
 def render_pdf_html(epreuve_id: str, captured: list, mode: str) -> str:
     header = f"<h1>{'Sujet' if mode=='sujet' else 'Corrigé'} – QCM tHarmo – Épreuve {html_escape(epreuve_id)}</h1>"
     parts = ["""
@@ -392,7 +351,7 @@ h2{font-size:12pt;margin:8mm 0 4mm}
     def esc(s): return html_escape((s or ""))
     for i, q in enumerate(captured, start=1):
         parts.append(f"<section class='qcm'><h2>{i}. {esc(q['title'])}</h2>")
-        if q["enonce"]:
+        if q.get("enonce"):
             parts.append(f"<div class='enonce'><strong>Énoncé</strong> : {esc(q['enonce'])}</div>")
         parts.append("<div class='lines'>")
         for it in q["items"]:
@@ -415,16 +374,14 @@ def html_to_pdf_bytes(play, html: str) -> bytes:
         p = ctx.new_page()
         p.set_content(html, wait_until="domcontentloaded")
         p.emulate_media(media="print")
-        pdf_bytes = p.pdf(
-            format="A4", print_background=True,
-            margin={"top":"10mm","right":"10mm","bottom":"12mm","left":"10mm"}
-        )
+        pdf_bytes = p.pdf(format="A4", print_background=True,
+                          margin={"top":"10mm","right":"10mm","bottom":"12mm","left":"10mm"})
         ctx.close()
         return pdf_bytes
     finally:
         browser.close()
 
-# ================== Run ==================
+# =============== Run ===============
 if submitted:
     ids = parse_ids(ids_text)
     if not username or not password or not ids:
@@ -438,7 +395,7 @@ if submitted:
                 try:
                     context = browser.new_context(viewport={"width": 1280, "height": 900})
                     page = context.new_page()
-                    # pas de timeouts globaux
+                    # pas de timeouts Playwright : on pilote nous-mêmes les attentes
                     page.set_default_timeout(0)
                     context.set_default_timeout(0)
 
@@ -454,35 +411,40 @@ if submitted:
                             continue
 
                         captured = []
-                        seen = set()
+                        seen = set()  # empreintes pour éviter les doublons
 
-                        # boucle questions
                         while True:
-                            # s'assurer qu'on est bien en correction pour cette question
                             if not ensure_correction_view(page):
                                 break
 
-                            # extraire
+                            # EXTRACT (robuste, via locators)
                             data = extract_current(page)
                             if data and data.get("items"):
-                                fp = _fingerprint_any_view(page)
-                                if fp and fp not in seen:
+                                fp = fingerprint_any(page)
+                                if fp not in seen:
                                     seen.add(fp)
                                     captured.append({
                                         "title": (data.get("title") or "").strip(),
                                         "enonce": html2txt(data.get("enonceHTML") or ""),
-                                        "items": [{
-                                            "letter": it.get("letter"),
-                                            "sujet": html2txt(it.get("sujetHTML") or ""),
-                                            "correction": html2txt(it.get("correctionHTML") or ""),
-                                            "reponse": html2txt(it.get("reponseHTML") or ""),
-                                            "isTrue": bool(it.get("isTrue")),
-                                            "isFalse": bool(it.get("isFalse")),
-                                        } for it in data.get("items", [])]
+                                        "items": data["items"],
                                     })
                                     st.write(f"✓ Capturé {len(captured)} : {captured[-1]['title'] or '(sans titre)'}")
+                            else:
+                                # Si rien n'est extrait alors qu'on est en correction, essayons un léger délai
+                                page.wait_for_timeout(300)
+                                data = extract_current(page)
+                                if data and data.get("items"):
+                                    fp = fingerprint_any(page)
+                                    if fp not in seen:
+                                        seen.add(fp)
+                                        captured.append({
+                                            "title": (data.get("title") or "").strip(),
+                                            "enonce": html2txt(data.get("enonceHTML") or ""),
+                                            "items": data["items"],
+                                        })
+                                        st.write(f"✓ Capturé {len(captured)} : {captured[-1]['title'] or '(sans titre)'}")
 
-                            # avancer (question suivante → QCM → Correction)
+                            # NEXT
                             if not go_next_and_reenter_correction(page):
                                 break
 
