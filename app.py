@@ -1,5 +1,5 @@
 # app.py — Streamlit + Playwright (export Sujet + Corrigé depuis tHarmo)
-# Version sans BeautifulSoup, avec échappement de guillemets robuste.
+# Version sans BeautifulSoup, guillemets normalisés (pas d'erreur de chaîne).
 
 import re
 from html import unescape as html_unescape, escape as html_escape
@@ -54,18 +54,18 @@ def html2txt(html: str) -> str:
     return re.sub(r"\s+", " ", tmp).strip()
 
 def dismiss_banners(page):
-    """Ferme les modales/cookies éventuelles (guillemets échappés correctement)."""
+    """Ferme les modales/cookies éventuelles (chaînes protégées)."""
     try:
         selectors = [
-            'button:has-text("Accepter")',
-            "button:has-text(\"J'accepte\")",
-            'button:has-text("J’accepte")',
-            'button:has-text("OK")',
+            "button:has-text(\"Accepter\")",
+            "button:has-text(\"J'accepte\")",   # apostrophe droite
+            "button:has-text(\"J’accepte\")",   # apostrophe courbe
+            "button:has-text(\"OK\")",
             "button:has-text(\"D'accord\")",
-            'button:has-text("D’accord")',
-            'button:has-text("Compris")',
-            'button:has-text("Fermer")',
-            '[aria-label="Fermer"]',
+            "button:has-text(\"D’accord\")",
+            "button:has-text(\"Compris\")",
+            "button:has-text(\"Fermer\")",
+            "[aria-label=\"Fermer\"]",
             "#didomi-notice-agree-button",
             "button.cookie-accept",
         ]
@@ -93,12 +93,12 @@ def try_login(page, base, username, password) -> bool:
     """Se connecte si nécessaire."""
     page.goto(base + "/banque/qc/entrainement/", wait_until="domcontentloaded")
     dismiss_banners(page)
-    if page.locator('input[type="password"]').count() == 0:
+    if page.locator("input[type=\"password\"]").count() == 0:
         return True
     try:
-        email_sel = 'input[type="email"], input[name*="mail" i], input[name*="user" i], input[name*="login" i]'
-        pwd_sel   = 'input[type="password"]'
-        btn_sel   = 'button:has-text("Connexion"), input[type="submit"], button[type="submit"]'
+        email_sel = "input[type=\"email\"], input[name*=\"mail\" i], input[name*=\"user\" i], input[name*=\"login\" i]"
+        pwd_sel   = "input[type=\"password\"]"
+        btn_sel   = "button:has-text(\"Connexion\"), input[type=\"submit\"], button[type=\"submit\"]"
         page.locator(email_sel).first.fill(username)
         page.locator(pwd_sel).first.fill(password)
         if page.locator(btn_sel).count() > 0:
@@ -288,7 +288,7 @@ if submitted:
                                     })
                                     st.write(f"✓ Capturé {len(captured)} : {captured[-1]['title'] or '(sans titre)'}")
 
-                            # Suivant ?
+                            # Suivante ?
                             if page.locator("#nextQuestionButton").count() > 0:
                                 try:
                                     page.locator("#nextQuestionButton").first.click()
@@ -299,7 +299,7 @@ if submitted:
                                 break
                             dismiss_banners(page)
 
-                            # Repasser en mode correction
+                            # Revenir en mode correction
                             if page.locator("#correction").count() > 0:
                                 try:
                                     page.locator("#correction").first.click()
