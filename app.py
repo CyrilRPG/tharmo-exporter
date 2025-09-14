@@ -1,12 +1,11 @@
 # app.py — Streamlit + Playwright (export Sujet + Corrigé depuis tHarmo)
-# Simplification : BS4 pour parser, boucle "Question suivante" + "Correction".
+# Parsage HTML via Playwright uniquement (pas de BeautifulSoup).
 
 import re
 from html import unescape as html_unescape, escape as html_escape
 
 import streamlit as st
 from playwright.sync_api import sync_playwright, Error as PwError
-from bs4 import BeautifulSoup
 
 APP_TITLE = "tHarmo → PDF (Sujet + Corrigé)"
 st.set_page_config(page_title=APP_TITLE, layout="centered")
@@ -38,7 +37,6 @@ def parse_ids(txt: str):
             m = re.search(r"(?:idEpreuve|idepreuve)\s*=\s*(\d+)", line, re.I)
             if m:
                 out.append(m.group(1))
-    # supprime les doublons
     dedup, seen = [], set()
     for x in out:
         if x not in seen:
@@ -88,16 +86,16 @@ def dismiss_banners(page):
         pass
 
 def try_login(page, base, username, password) -> bool:
-    """Se connecte si besoin."""
+    """Se connecte si nécessaire."""
     page.goto(base + "/banque/qc/entrainement/", wait_until="domcontentloaded")
     dismiss_banners(page)
-    # déjà connecté ?
+    # vérifie si on voit un champ password
     if page.locator('input[type="password"]').count() == 0:
         return True
     try:
         email_sel = 'input[type="email"], input[name*="mail" i], input[name*="user" i], input[name*="login" i]'
         pwd_sel   = 'input[type="password"]'
-        btn_sel   = 'button:has-text("Connexion"), input[type="submit"], button[type="submit"]'
+        btn_sel   = 'button:has-text("Connexion"), input[type="submit"), button[type="submit"]'
         page.locator(email_sel).first.fill(username)
         page.locator(pwd_sel).first.fill(password)
         if page.locator(btn_sel).count() > 0:
@@ -111,11 +109,11 @@ def try_login(page, base, username, password) -> bool:
         return False
 
 def start_correction(page, base, eid) -> bool:
-    """Ouvre l'épreuve et clique sur 'Correction'."""
+    """Ouvre l’épreuve en correction."""
     page.goto(f"{base}/banque/qc/entrainement/qcmparqcm/idEpreuve={eid}", wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
     dismiss_banners(page)
-    # clic sur Correction
+    # clic Correction
     if page.locator("#correction").count() > 0:
         page.locator("#correction").first.click()
         page.wait_for_load_state("domcontentloaded")
@@ -128,48 +126,55 @@ def start_correction(page, base, eid) -> bool:
         dismiss_banners(page)
         return True
 
-def extract_bs4(html: str):
+def extract_current(page):
     """
-    Analyse la page de Correction avec BeautifulSoup.
+    Extrait la question courante et ses items depuis la page de correction
+    en utilisant uniquement Playwright.
     Retourne {title, items} ou None.
     """
-    soup = BeautifulSoup(html, "html.parser")
-    for card in soup.find_all("div", class_="card card-content"):
-        # détecte les Items A..E
-        if not card.find(string=re.compile(r"^Item\\s+[A-E]", flags=re.I)):
-            continue
-        title_tag = card.find("div", class_="card-title")
-        title = title_tag.get_text(strip=True) if title_tag else ""
+    try:
+        # Carte principale
+        card = page.locator(".card.card-content").first
+        if card.count() == 0:
+            return None
+        # Titre (QCM : ...)
+        title_el = card.locator("div.card-title").first
+        title = title_el.text_content().strip() if title_el.count() else ""
         items = []
-        for span in card.find_all("span", class_="card-title"):
-            txt = span.get_text(strip=True)
-            m = re.match(r"^Item\\s+([A-E])", txt, flags=re.I)
-            if not m:
+        # Itère sur tous les span.card-title
+        for span in card.locator("span.card-title").all():
+            text = span.text_content().strip()
+            if not re.match(r"^Item\\s+[A-E]", text, flags=re.I):
                 continue
-            letter = m.group(1).upper()
-            row = span.find_next_sibling(lambda tag: tag.name == "div" and "row" in tag.get("class", []))
-            if not row:
+            letter = text.split()[1].strip().upper()
+            # Trouve le prochain frère .row
+            row = span.locator("xpath=following-sibling::*[contains(@class,'row')][1]")
+            if row.count() == 0:
                 continue
-            cols = [c for c in row.find_all("div", recursive=False) if "col" in c.get("class", [])]
+            cols = row.locator(":scope > div").all()
+            if not cols:
+                continue
             sujet = corr = rep = ""
             is_true = is_false = False
-            if len(cols) >= 1:
-                p = cols[0].find("p")
-                text = p.get_text(separator=" ", strip=True) if p else cols[0].get_text(strip=True)
-                sujet = re.sub(r"^Sujet\\s*:\\s*", "", text, flags=re.I)
+            # Sujet
+            col0 = cols[0]
+            p0 = col0.locator("p").first
+            text_sujet = p0.inner_text().strip() if p0.count() else col0.inner_text().strip()
+            sujet = re.sub(r"^Sujet\\s*:?", "", text_sujet, flags=re.I).strip()
+            # Correction + verdict
             if len(cols) >= 2:
-                p = cols[1].find("p")
-                text = p.get_text(separator=" ", strip=True) if p else cols[1].get_text(strip=True)
-                corr = re.sub(r"^Correction\\s*:\\s*", "", text, flags=re.I)
-                # verdict : vert ou rouge
-                if cols[1].find("span", class_="green-text"):
-                    is_true = True
-                if cols[1].find("span", class_="red-text"):
-                    is_false = True
+                col1 = cols[1]
+                p1 = col1.locator("p").first
+                text_corr = p1.inner_text().strip() if p1.count() else col1.inner_text().strip()
+                corr = re.sub(r"^Correction\\s*:?", "", text_corr, flags=re.I).strip()
+                is_true  = col1.locator(".green-text").count() > 0
+                is_false = col1.locator(".red-text").count() > 0
+            # Réponse
             if len(cols) >= 3:
-                p = cols[2].find("p")
-                text = p.get_text(separator=" ", strip=True) if p else cols[2].get_text(strip=True)
-                rep = re.sub(r"^Votre r[ée]ponse\\s*:\\s*", "", text, flags=re.I)
+                col2 = cols[2]
+                p2 = col2.locator("p").first
+                text_rep = p2.inner_text().strip() if p2.count() else col2.inner_text().strip()
+                rep = re.sub(r"^Votre r[ée]ponse\\s*:?", "", text_rep, flags=re.I).strip()
             items.append(
                 {
                     "letter": letter,
@@ -182,6 +187,8 @@ def extract_bs4(html: str):
             )
         if items:
             return {"title": title, "items": items}
+    except Exception:
+        pass
     return None
 
 def render_pdf_html(eid: str, captured: list, mode: str) -> str:
@@ -195,7 +202,6 @@ body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-ser
 h1{font-size:18pt;margin:0 0 8mm}
 h2{font-size:12pt;margin:8mm 0 4mm}
 .qcm{break-inside:avoid;margin-bottom:10mm;padding-bottom:5mm;border-bottom:1px solid #ddd}
-.enonce{margin:3mm 0 4mm}
 .lines{margin-left:2mm}
 .line{margin:2mm 0}
 .muted{color:#666;font-size:10pt}
@@ -273,9 +279,8 @@ if submitted:
                         seen = set()
 
                         while True:
-                            # extraction BS4
-                            html_page = page.content()
-                            data = extract_bs4(html_page)
+                            # extraction via Playwright
+                            data = extract_current(page)
                             if data and data.get("items"):
                                 fp = data["title"] + data["items"][0]["letter"]
                                 if fp not in seen:
