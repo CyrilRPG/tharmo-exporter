@@ -6,8 +6,7 @@ import time
 from html import unescape as html_unescape, escape as html_escape
 
 import streamlit as st
-from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout, Error as PwError
-
+from playwright.sync_api import sync_playwright, Error as PwError
 
 APP_TITLE = "tHarmo → PDF (Sujet + Corrigé)"
 st.set_page_config(page_title=APP_TITLE, layout="centered")
@@ -95,7 +94,8 @@ def dismiss_banners(page):
             """() => {
                 for (const s of ['.cookie', '.modal', '#cookie', '.overlay', '.consent']) {
                     document.querySelectorAll(s).forEach(n => {
-                        if (getComputedStyle(n).zIndex > '1000') n.style.display = 'none';
+                        const z = getComputedStyle(n).zIndex || "0";
+                        if (parseInt(z, 10) >= 1000) n.style.display = 'none';
                     });
                 }
             }"""
@@ -115,6 +115,7 @@ def wait_for_any_selector(page, selectors, timeout_ms=None) -> bool:
             try:
                 loc = page.locator(s)
                 if loc.count() > 0:
+                    # visible si possible, sinon présent
                     try:
                         loc.first.wait_for(state="visible")  # pas de timeout
                         return True
@@ -205,7 +206,7 @@ def in_correction_view(page) -> bool:
         item_count = page.locator('span.card-title:has-text("Item")').count()
         title_el = page.locator(".card .card-content .card-title").first
         title = (title_el.text_content() or "").strip() if title_el else ""
-        return (next_count > 0 and item_count > 0) or (re.search(r"Epreuve\s+\d+", title or "", re.I) is not None)
+        return (next_count > 0 and item_count > 0) or (re.search(r"Epreuve\\s+\\d+", title or "", re.I) is not None)
     except Exception:
         return False
 
@@ -323,58 +324,129 @@ def extract_current(page):
     )
 
 
-def go_next(page) -> bool:
-    """Avance à la question suivante de manière robuste. Retourne True si la page a changé."""
-    def signature():
-        try:
-            title = page.locator(".card .card-content .card-title").first.text_content() or ""
-        except Exception:
-            title = ""
-        try:
-            idhint = page.evaluate(
-                """() => {
-              const n = document.querySelector('[id^="modalInfo"],[id^="modalSignalement"],[id^="marqueIcon"],[id^="marqueButton"]');
-              return n?.id || "";
-            }"""
-            )
-        except Exception:
-            idhint = ""
-        return (title.strip(), idhint)
+# === Empreinte & navigation ===
+def _question_fingerprint(page) -> str:
+    """Empreinte robuste du contenu courant (change quand on passe à la question suivante)."""
+    try:
+        return page.evaluate("""() => {
+            const cont = document.querySelector(".card .card-content") || document.querySelector(".card-content");
+            if (!cont) return "";
+            const title = (cont.querySelector(".card-title, span.card-title")?.textContent || "").trim();
 
-    before = signature()
+            // Énoncé texte (stable)
+            const enonceNode = Array.from(cont.querySelectorAll(".card-title, span.card-title"))
+              .find(t => /enonc/i.test(t.textContent||""));
+            let enonceTxt = "";
+            if (enonceNode) {
+              let n = enonceNode.nextSibling;
+              while(n){
+                if(n.nodeType===1){
+                  const el=n;
+                  if (el.matches(".divider.with-margin")) break;
+                  if (el.matches("span.card-title") && /^Item\\s+[A-E]/i.test(el.textContent||"")) break;
+                  enonceTxt += " " + (el.textContent || "");
+                } else if (n.nodeType===3) {
+                  enonceTxt += " " + n.textContent;
+                }
+                n = n.nextSibling;
+              }
+            }
+
+            // Items (3 premiers)
+            const items = Array.from(cont.querySelectorAll("span.card-title"))
+              .filter(s => /^Item\\s+[A-E]/i.test((s.textContent||"").trim()))
+              .slice(0, 3)
+              .map(span => {
+                let row = span.nextElementSibling;
+                while(row && !row.matches(".row")){
+                  if(row.matches("span.card-title")) break;
+                  row = row.nextElementSibling;
+                }
+                const sujet = row ? (row.querySelector(":scope > .col, :scope > [class*=col] p")?.textContent || "") : "";
+                return (span.textContent || "").trim() + "::" + (sujet || "").trim();
+              })
+              .join("|");
+
+            const progress = (document.querySelector(".progress .determinate")?.getAttribute("style") || "") +
+                             (document.querySelector(".pagination li.active")?.textContent || "").trim();
+            const bodySnippet = (cont.innerText || "").replace(/\\s+/g," ").slice(0, 300);
+
+            return [title, enonceTxt.trim(), items, progress, bodySnippet].join("§");
+        }""")
+    except Exception:
+        return ""
+
+
+def go_next(page) -> bool:
+    """
+    Avance à la question suivante.
+    Retourne True si le contenu a changé (empreinte différente), False sinon.
+    """
+    before = _question_fingerprint(page)
+
+    # Toujours scroller : certains sites n'activent le bouton qu'en bas
     try:
         page.evaluate("() => window.scrollTo({top:document.body.scrollHeight, behavior:'instant'})")
     except Exception:
         pass
 
-    tries = [
+    actions = [
         lambda: page.locator("#nextQuestionButton").first.click(),
         lambda: page.locator("a#nextQuestion").first.click(),
         lambda: page.locator('a:has-text("Question suivante")').first.click(),
         lambda: page.locator('button:has-text("Question suivante")').first.click(),
-        lambda: (lambda href: page.goto(href))(page.evaluate(
-            """() => {
-            const a = document.querySelector('#nextQuestion') || document.querySelector('#nextQuestionButton')?.closest('a');
-            const href = a?.getAttribute('href') || null;
-            if (!href) return null;
-            return href.startsWith('http') ? href : (location.origin + (href.startsWith('/')? href : '/' + href));
-        }"""
-        )),
+        # Pagination (numéro suivant)
+        lambda: page.locator(".pagination li.active + li a").first.click(),
+        lambda: page.locator("a[rel=next]").first.click(),
+        # Touche clavier (parfois supportée)
+        lambda: page.keyboard.press("ArrowRight"),
+        lambda: page.keyboard.press("PageDown"),
     ]
-    for t in tries:
+
+    for act in actions:
         try:
-            t()
-            page.wait_for_load_state("domcontentloaded")
+            act()
         except Exception:
-            pass
-        after = signature()
-        if after != before:
+            continue
+
+        # Attente active d'un changement réel (jusqu'à ~2.5s)
+        changed = False
+        for _ in range(10):
+            page.wait_for_timeout(250)
+            dismiss_banners(page)
+            after = _question_fingerprint(page)
+            if after and after != before:
+                changed = True
+                break
+        if changed:
             return True
-        dismiss_banners(page)
-        page.wait_for_timeout(150)
+
+    # Dernier recours : navigation directe si un lien "suivant" a un href
+    try:
+        href = page.evaluate("""() => {
+            const a = document.querySelector('#nextQuestion') ||
+                      document.querySelector('#nextQuestionButton')?.closest('a') ||
+                      document.querySelector('.pagination li.active + li a') ||
+                      document.querySelector('a[rel=next]');
+            if (!a) return null;
+            const h = a.getAttribute('href') || null;
+            if (!h) return null;
+            return h.startsWith('http') ? h : (location.origin + (h.startsWith('/')? h : '/' + h));
+        }""")
+        if href:
+            page.goto(href, wait_until="domcontentloaded")
+            for _ in range(10):
+                page.wait_for_timeout(250)
+                after = _question_fingerprint(page)
+                if after and after != before:
+                    return True
+    except Exception:
+        pass
+
     return False
 
 
+# ====== Rendu PDF ======
 def render_pdf_html(epreuve_id: str, captured: list, mode: str) -> str:
     # mode: "sujet" or "corrige"
     header = f"<h1>{'Sujet' if mode=='sujet' else 'Corrigé'} – QCM tHarmo – Épreuve {html_escape(epreuve_id)}</h1>"
@@ -450,7 +522,6 @@ if submitted:
                 try:
                     context = browser.new_context(viewport={"width": 1280, "height": 900})
                     page = context.new_page()
-
                     # Désactive TOUT timeout global Playwright (pas de limite)
                     page.set_default_timeout(0)
                     context.set_default_timeout(0)
@@ -469,9 +540,9 @@ if submitted:
 
                         captured = []
                         seen = set()
+
                         # boucle jusqu’à la fin
                         while True:
-                            # plus de .wait_for_selector avec timeout : on utilise notre attente sans limite
                             wait_for_any_selector(
                                 page,
                                 selectors=[
@@ -484,9 +555,9 @@ if submitted:
 
                             data = extract_current(page)
                             if data and data.get("items"):
-                                key = f"{data.get('title','').strip()}::{(data.get('enonceHTML') or '')[:120]}"
-                                if key not in seen:
-                                    seen.add(key)
+                                fp = _question_fingerprint(page)  # empreinte robuste
+                                if fp and fp not in seen:
+                                    seen.add(fp)
                                     captured.append(
                                         {
                                             "title": (data.get("title") or "").strip(),
