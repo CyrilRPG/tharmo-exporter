@@ -2,10 +2,8 @@
 # Ouvre cette appli depuis l'iPad (URL Render) — aucune install sur l'iPad.
 
 import re
-import io
 import time
 from html import unescape as html_unescape, escape as html_escape
-from pathlib import Path
 
 import streamlit as st
 from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout, Error as PwError
@@ -54,13 +52,9 @@ def html2txt(html: str) -> str:
     """Convertit un fragment HTML en texte lisible pour PDF (simple)."""
     if not html:
         return ""
-    # Exposants simples <sup>2</sup> -> ^2
     html = re.sub(r"(?is)<\s*sup\s*>(.*?)</\s*sup\s*>", lambda m: "^" + m.group(1), html)
-    # Supprimer les balises en conservant le texte
     tmp = re.sub(r"(?is)<[^>]+>", "", html)
-    # Décoder les entités HTML
     tmp = html_unescape(tmp)
-    # Normaliser les espaces
     return re.sub(r"\s+", " ", tmp).strip()
 
 
@@ -80,7 +74,6 @@ def looks_like_login(page) -> bool:
 def dismiss_banners(page):
     """Ferme quelques overlays/bannières susceptibles de bloquer les clics."""
     try:
-        # Cookies / consentements / modales communes
         candidates = [
             'button:has-text("Accepter")',
             'button:has-text("J\'accepte")',
@@ -95,10 +88,9 @@ def dismiss_banners(page):
         for sel in candidates:
             if page.locator(sel).first.count() > 0:
                 try:
-                    page.locator(sel).first.click(timeout=1000)
+                    page.locator(sel).first.click()
                 except Exception:
                     pass
-        # Retirer overlays plein écran connus
         page.evaluate(
             """() => {
                 for (const s of ['.cookie', '.modal', '#cookie', '.overlay', '.consent']) {
@@ -112,83 +104,98 @@ def dismiss_banners(page):
         pass
 
 
-def wait_for_any_selector(page, selectors, timeout_ms=20000) -> bool:
-    """Attend qu'au moins un sélecteur soit présent/visible."""
-    end = time.monotonic() + timeout_ms / 1000.0
-    last_err = None
-    while time.monotonic() < end:
+def wait_for_any_selector(page, selectors, timeout_ms=None) -> bool:
+    """
+    Attend qu'au moins un sélecteur soit présent/visible.
+    timeout_ms=None => pas de limite (boucle jusqu'à succès).
+    """
+    def any_present() -> bool:
         dismiss_banners(page)
         for s in selectors:
             try:
                 loc = page.locator(s)
                 if loc.count() > 0:
-                    # visible si possible, sinon présent
                     try:
-                        loc.first.wait_for(state="visible", timeout=500)
+                        loc.first.wait_for(state="visible")  # pas de timeout
                         return True
                     except Exception:
                         return True
-            except Exception as e:
-                last_err = e
-        page.wait_for_timeout(250)
-    if last_err:
+            except Exception:
+                pass
         return False
-    return False
+
+    if timeout_ms is None:
+        while True:
+            if any_present():
+                return True
+            page.wait_for_timeout(250)
+    else:
+        end = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < end:
+            if any_present():
+                return True
+            page.wait_for_timeout(250)
+        return False
 
 
-def try_login(page, base, username, password, timeout_ms=30000):
+def try_login(page, base, username, password):
     """Se rend sur une page protégée et se connecte si nécessaire."""
-    # Aller sur une page protégée → redirection login
     page.goto(base + "/banque/qc/entrainement/", wait_until="domcontentloaded")
     dismiss_banners(page)
     if not looks_like_login(page):
-        return True  # déjà connecté
+        return True
 
-    # Heuristiques de formulaire de login
     try:
         email_sel = 'input[type="email"], input[name*="mail" i], input[name*="user" i], input[name*="login" i]'
         pwd_sel = 'input[type="password"]'
         btn_sel = 'button:has-text("Connexion"), input[type="submit"], button[type="submit"]'
 
-        page.locator(email_sel).first.fill(username, timeout=5000)
-        page.locator(pwd_sel).first.fill(password, timeout=5000)
+        page.locator(email_sel).first.fill(username)
+        page.locator(pwd_sel).first.fill(password)
         if page.locator(btn_sel).count() > 0:
             page.locator(btn_sel).first.click()
         else:
             page.keyboard.press("Enter")
 
-        page.wait_for_url(lambda u: re.search(r"(login|connexion|auth)", u, re.I) is None, timeout=timeout_ms)
-        # petite marge
+        page.wait_for_url(lambda u: re.search(r"(login|connexion|auth)", u, re.I) is None)
         page.wait_for_load_state("domcontentloaded")
         dismiss_banners(page)
         return True
-    except PwTimeout:
-        return False
     except Exception:
         return False
 
 
-def wait_for_correction_href(page, timeout_ms=15000):
+def wait_for_correction_href(page, timeout_ms=None):
     """Repère le lien vers la correction sur la page d'épreuve."""
-    deadline = time.monotonic() + timeout_ms / 1000.0
-    while time.monotonic() < deadline:
+    def find_href():
         try:
-            href = page.evaluate(
+            return page.evaluate(
                 """() => {
-                const byId = document.querySelector('#correction');
-                if (byId && byId.getAttribute('href'))
-                    return new URL(byId.getAttribute('href'), location.origin).toString();
-                const cand = Array.from(document.querySelectorAll('a[href]'))
-                  .find(a => /\\/banque\\/qc\\/entrainement\\/correction\\/commencer\\//.test(a.getAttribute('href')||''));
-                return cand ? new URL(cand.getAttribute('href'), location.origin).toString() : null;
-            }"""
+                    const byId = document.querySelector('#correction');
+                    if (byId && byId.getAttribute('href'))
+                        return new URL(byId.getAttribute('href'), location.origin).toString();
+                    const cand = Array.from(document.querySelectorAll('a[href]'))
+                      .find(a => /\\/banque\\/qc\\/entrainement\\/correction\\/commencer\\//.test(a.getAttribute('href')||''));
+                    return cand ? new URL(cand.getAttribute('href'), location.origin).toString() : null;
+                }"""
             )
+        except Exception:
+            return None
+
+    if timeout_ms is None:
+        while True:
+            href = find_href()
             if href:
                 return href
-        except Exception:
-            pass
-        page.wait_for_timeout(250)
-    return None
+            page.wait_for_timeout(250)
+    else:
+        end = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < end:
+            href = find_href()
+            if href:
+                return href
+            page.wait_for_timeout(250)
+        return None
 
 
 def in_correction_view(page) -> bool:
@@ -212,25 +219,23 @@ def start_correction(page, base, epreuve_id):
     page.wait_for_load_state("networkidle")
     dismiss_banners(page)
 
-    href = wait_for_correction_href(page, 15000) or url_corr
+    href = wait_for_correction_href(page) or url_corr
     try:
         page.goto(href, wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle")
     except Exception:
-        # Dernier recours : clic DOM sur #correction
         try:
             page.evaluate(
                 """() => {
-                const a = document.querySelector('#correction');
-                if (a) a.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-            }"""
+                    const a = document.querySelector('#correction');
+                    if (a) a.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+                }"""
             )
-            page.wait_for_load_state("domcontentloaded", timeout=5000)
+            page.wait_for_load_state("domcontentloaded")
         except Exception:
             pass
 
     dismiss_banners(page)
-    # Attendre que la structure de correction apparaisse
     got = wait_for_any_selector(
         page,
         selectors=[
@@ -240,7 +245,7 @@ def start_correction(page, base, epreuve_id):
             "a#nextQuestion",
             'a:has-text("Question suivante")',
         ],
-        timeout_ms=20000,
+        timeout_ms=None,  # pas de limite
     )
     return got or in_correction_view(page)
 
@@ -342,7 +347,6 @@ def go_next(page) -> bool:
     except Exception:
         pass
 
-    # Essais progressifs
     tries = [
         lambda: page.locator("#nextQuestionButton").first.click(),
         lambda: page.locator("a#nextQuestion").first.click(),
@@ -360,10 +364,9 @@ def go_next(page) -> bool:
     for t in tries:
         try:
             t()
-            page.wait_for_load_state("domcontentloaded", timeout=4000)
+            page.wait_for_load_state("domcontentloaded")
         except Exception:
             pass
-        # detect change
         after = signature()
         if after != before:
             return True
@@ -447,7 +450,10 @@ if submitted:
                 try:
                     context = browser.new_context(viewport={"width": 1280, "height": 900})
                     page = context.new_page()
-                    page.set_default_timeout(20000)
+
+                    # Désactive TOUT timeout global Playwright (pas de limite)
+                    page.set_default_timeout(0)
+                    context.set_default_timeout(0)
 
                     # Login
                     if not try_login(page, base, username, password):
@@ -464,31 +470,17 @@ if submitted:
                         captured = []
                         seen = set()
                         # boucle jusqu’à la fin
-                        consecutive_timeouts = 0
                         while True:
-                            # Attendre un conteneur raisonnable de contenu
-                            ready = wait_for_any_selector(
+                            # plus de .wait_for_selector avec timeout : on utilise notre attente sans limite
+                            wait_for_any_selector(
                                 page,
                                 selectors=[
                                     ".card .card-content",
                                     ".card-content",
                                     'span.card-title:has-text("Item")',
                                 ],
-                                timeout_ms=20000,
+                                timeout_ms=None,  # pas de limite
                             )
-                            if not ready:
-                                consecutive_timeouts += 1
-                                if consecutive_timeouts >= 2:
-                                    # rechargement de secours
-                                    try:
-                                        page.reload(wait_until="domcontentloaded")
-                                        page.wait_for_load_state("networkidle")
-                                        consecutive_timeouts = 0
-                                        dismiss_banners(page)
-                                    except Exception:
-                                        break
-                                else:
-                                    continue
 
                             data = extract_current(page)
                             if data and data.get("items"):
