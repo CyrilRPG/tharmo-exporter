@@ -1,5 +1,5 @@
 # app.py — Streamlit + Playwright (export Sujet + Corrigé depuis tHarmo)
-# Parsage HTML via Playwright uniquement (pas de BeautifulSoup).
+# Cette version n'utilise pas BeautifulSoup et corrige les problèmes de guillemets.
 
 import re
 from html import unescape as html_unescape, escape as html_escape
@@ -12,7 +12,7 @@ st.set_page_config(page_title=APP_TITLE, layout="centered")
 st.title(APP_TITLE)
 st.caption("Entrez vos identifiants tHarmo + l’ID d’épreuve. L’appli génère 2 PDF à télécharger.")
 
-# ========= UI =========
+# ========= Interface utilisateur =========
 with st.form("params"):
     base = st.text_input("Base tHarmo", "https://pass.tharmo.tutotours.fr").strip().rstrip("/")
     username = st.text_input("Email / Identifiant tHarmo", value="", autocomplete="username")
@@ -24,7 +24,7 @@ with st.form("params"):
     )
     submitted = st.form_submit_button("Exporter (Sujet + Corrigé)")
 
-# ========= Utils =========
+# ========= Fonctions utilitaires =========
 def parse_ids(txt: str):
     out = []
     for line in (txt or "").splitlines():
@@ -45,33 +45,36 @@ def parse_ids(txt: str):
     return dedup
 
 def html2txt(html: str) -> str:
-    """Simplifie le HTML en texte."""
+    """Simplifie le HTML en texte brut."""
     if not html:
         return ""
-    html = re.sub(r"(?is)<\\s*sup\\s*>(.*?)</\\s*sup\\s*>", lambda m: "^" + m.group(1), html)
+    html = re.sub(r"(?is)<\s*sup\s*>(.*?)</\s*sup\s*>", lambda m: "^" + m.group(1), html)
     tmp = re.sub(r"(?is)<[^>]+>", "", html)
     tmp = html_unescape(tmp)
-    return re.sub(r"\\s+", " ", tmp).strip()
+    return re.sub(r"\s+", " ", tmp).strip()
 
 def dismiss_banners(page):
-    """Ferme les modales/cookies éventuelles."""
+    """Ferme les modales ou bannières de cookies éventuelles."""
     try:
-        for sel in [
+        # Liste de sélecteurs (avec guillemets correctement équilibrés)
+        selectors = [
             'button:has-text("Accepter")',
-            'button:has-text("J\\'accepte")',
+            'button:has-text("J’accepte")',
             'button:has-text("OK")',
-            'button:has-text("D\\'accord")',
+            'button:has-text("D’accord")',
             'button:has-text("Compris")',
             'button:has-text("Fermer")',
             '[aria-label="Fermer"]',
             '#didomi-notice-agree-button',
             'button.cookie-accept',
-        ]:
+        ]
+        for sel in selectors:
             if page.locator(sel).first.count() > 0:
                 try:
                     page.locator(sel).first.click()
                 except Exception:
                     pass
+        # Masque les overlays avec un z-index élevé
         page.evaluate(
             """() => {
                 for (const s of ['.cookie', '.modal', '#cookie', '.overlay', '.consent']) {
@@ -89,13 +92,13 @@ def try_login(page, base, username, password) -> bool:
     """Se connecte si nécessaire."""
     page.goto(base + "/banque/qc/entrainement/", wait_until="domcontentloaded")
     dismiss_banners(page)
-    # vérifie si on voit un champ password
+    # Si aucun champ password n'est visible, on est déjà connecté.
     if page.locator('input[type="password"]').count() == 0:
         return True
     try:
         email_sel = 'input[type="email"], input[name*="mail" i], input[name*="user" i], input[name*="login" i]'
         pwd_sel   = 'input[type="password"]'
-        btn_sel   = 'button:has-text("Connexion"), input[type="submit"), button[type="submit"]'
+        btn_sel   = 'button:has-text("Connexion"), input[type="submit"], button[type="submit"]'
         page.locator(email_sel).first.fill(username)
         page.locator(pwd_sel).first.fill(password)
         if page.locator(btn_sel).count() > 0:
@@ -109,18 +112,18 @@ def try_login(page, base, username, password) -> bool:
         return False
 
 def start_correction(page, base, eid) -> bool:
-    """Ouvre l’épreuve en correction."""
+    """Ouvre l’épreuve en mode correction."""
     page.goto(f"{base}/banque/qc/entrainement/qcmparqcm/idEpreuve={eid}", wait_until="domcontentloaded")
     page.wait_for_load_state("networkidle")
     dismiss_banners(page)
-    # clic Correction
+    # Clique sur « Correction » s'il est présent
     if page.locator("#correction").count() > 0:
         page.locator("#correction").first.click()
         page.wait_for_load_state("domcontentloaded")
         dismiss_banners(page)
         return True
     else:
-        # fallback
+        # Fallback : accès direct à la correction
         page.goto(f"{base}/banque/qc/entrainement/correction/commencer/fin=0/id={eid}", wait_until="domcontentloaded")
         page.wait_for_load_state("networkidle")
         dismiss_banners(page)
@@ -128,26 +131,22 @@ def start_correction(page, base, eid) -> bool:
 
 def extract_current(page):
     """
-    Extrait la question courante et ses items depuis la page de correction
-    en utilisant uniquement Playwright.
+    Extrait la question courante et ses items (Sujet, Correction, réponse) à partir du DOM
+    de la page de correction, en utilisant uniquement Playwright.
     Retourne {title, items} ou None.
     """
     try:
-        # Carte principale
         card = page.locator(".card.card-content").first
         if card.count() == 0:
             return None
-        # Titre (QCM : ...)
         title_el = card.locator("div.card-title").first
         title = title_el.text_content().strip() if title_el.count() else ""
         items = []
-        # Itère sur tous les span.card-title
         for span in card.locator("span.card-title").all():
             text = span.text_content().strip()
             if not re.match(r"^Item\\s+[A-E]", text, flags=re.I):
                 continue
             letter = text.split()[1].strip().upper()
-            # Trouve le prochain frère .row
             row = span.locator("xpath=following-sibling::*[contains(@class,'row')][1]")
             if row.count() == 0:
                 continue
@@ -175,16 +174,14 @@ def extract_current(page):
                 p2 = col2.locator("p").first
                 text_rep = p2.inner_text().strip() if p2.count() else col2.inner_text().strip()
                 rep = re.sub(r"^Votre r[ée]ponse\\s*:?", "", text_rep, flags=re.I).strip()
-            items.append(
-                {
-                    "letter": letter,
-                    "sujet": sujet,
-                    "correction": corr,
-                    "reponse": rep,
-                    "isTrue": is_true,
-                    "isFalse": is_false,
-                }
-            )
+            items.append({
+                "letter": letter,
+                "sujet": sujet,
+                "correction": corr,
+                "reponse": rep,
+                "isTrue": is_true,
+                "isFalse": is_false,
+            })
         if items:
             return {"title": title, "items": items}
     except Exception:
@@ -231,6 +228,7 @@ h2{font-size:12pt;margin:8mm 0 4mm}
     return "".join(parts)
 
 def html_to_pdf_bytes(play, html: str) -> bytes:
+    """Génère un PDF à partir du HTML fourni via Playwright (contexte séparé)."""
     browser = play.chromium.launch(headless=True)
     try:
         ctx = browser.new_context(viewport={"width": 1280, "height": 900})
@@ -247,7 +245,7 @@ def html_to_pdf_bytes(play, html: str) -> bytes:
     finally:
         browser.close()
 
-# ========= Run =========
+# ========= Exécution principale =========
 if submitted:
     ids = parse_ids(ids_text)
     if not username or not password or not ids:
@@ -279,23 +277,22 @@ if submitted:
                         seen = set()
 
                         while True:
-                            # extraction via Playwright
+                            # Extraction via Playwright
                             data = extract_current(page)
                             if data and data.get("items"):
-                                fp = data["title"] + data["items"][0]["letter"]
+                                # Empreinte simple pour éviter les doublons (titre + première lettre)
+                                fp = data["title"] + (data["items"][0]["letter"] if data["items"] else "")
                                 if fp not in seen:
                                     seen.add(fp)
-                                    captured.append(
-                                        {
-                                            "title": (data.get("title") or "").strip(),
-                                            "items": data["items"],
-                                        }
-                                    )
+                                    captured.append({
+                                        "title": (data.get("title") or "").strip(),
+                                        "items": data["items"],
+                                    })
                                     st.write(
                                         f"✓ Capturé {len(captured)} : {captured[-1]['title'] or '(sans titre)'}"
                                     )
 
-                            # clique "Question suivante"
+                            # Clique « Question suivante »
                             if page.locator("#nextQuestionButton").count() > 0:
                                 try:
                                     page.locator("#nextQuestionButton").first.click()
@@ -303,11 +300,10 @@ if submitted:
                                 except Exception:
                                     break
                             else:
-                                # fin d’épreuve
-                                break
+                                break  # Fin d’épreuve
                             dismiss_banners(page)
 
-                            # après next, on doit cliquer sur "Correction"
+                            # Après « suivante », clique « Correction » pour revenir à la correction
                             if page.locator("#correction").count() > 0:
                                 try:
                                     page.locator("#correction").first.click()
@@ -320,7 +316,7 @@ if submitted:
                             st.warning("Aucune question capturée.")
                             continue
 
-                        # génération des PDF
+                        # Génération des deux PDF (sujet et corrigé)
                         html_sujet = render_pdf_html(eid, captured, "sujet")
                         html_corr  = render_pdf_html(eid, captured, "corrige")
                         sujet_name = f"qcm_tharmo_{eid}_sujet.pdf"
@@ -343,7 +339,7 @@ if submitted:
                                 mime="application/pdf",
                             )
                         except Exception as e:
-                            st.error(f"Erreur PDF: {e}")
+                            st.error(f"Erreur PDF : {e}")
 
                 finally:
                     try:
@@ -352,9 +348,9 @@ if submitted:
                         pass
                     browser.close()
         except PwError as e:
-            st.error(f"Erreur Playwright : {e}")
+            st.error(f"Erreur Playwright : {e}")
         except Exception as e:
-            st.error(f"Erreur inattendue : {e}")
+            st.error(f"Erreur inattendue : {e}")
 
 st.divider()
 with st.expander("Notes & Conseils"):
