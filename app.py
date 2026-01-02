@@ -1,5 +1,11 @@
 # app.py — Streamlit + Playwright (export Sujet + Corrigé depuis tHarmo)
+#
 # Version sans BeautifulSoup, guillemets normalisés (pas d'erreur de chaîne).
+#
+# MODIF UNIQUE DEMANDÉE :
+# - Ajout d’un upload multiple de fichiers HTML.
+# - Si vous uploadez plusieurs HTML, l’app génère un PDF (1 par HTML) à télécharger.
+# - Le reste du code est inchangé (export tHarmo Sujet + Corrigé via identifiants + ID d’épreuve).
 
 import re
 from html import unescape as html_unescape, escape as html_escape
@@ -17,11 +23,21 @@ with st.form("params"):
     base = st.text_input("Base tHarmo", "https://pass.tharmo.tutotours.fr").strip().rstrip("/")
     username = st.text_input("Email / Identifiant tHarmo", value="", autocomplete="username")
     password = st.text_input("Mot de passe tHarmo", value="", type="password", autocomplete="current-password")
+
     ids_text = st.text_area(
         "ID(s) d’épreuve (un par ligne ou collez l’URL)",
         placeholder="1914339\nhttps://pass.tharmo.tutotours.fr/banque/qc/entrainement/qcmparqcm/idEpreuve=1914315",
         height=100,
     )
+
+    # ====== MODIF : upload multiple HTML ======
+    html_files = st.file_uploader(
+        "Uploader un ou plusieurs fichiers HTML (1 PDF sera généré par fichier)",
+        type=["html", "htm"],
+        accept_multiple_files=True,
+    )
+    # =========================================
+
     submitted = st.form_submit_button("Exporter (Sujet + Corrigé)")
 
 # ========= Utilitaires =========
@@ -44,6 +60,7 @@ def parse_ids(txt: str):
             dedup.append(x)
     return dedup
 
+
 def html2txt(html: str) -> str:
     """Simplifie du HTML en texte."""
     if not html:
@@ -52,6 +69,7 @@ def html2txt(html: str) -> str:
     tmp = re.sub(r"(?is)<[^>]+>", "", html)
     tmp = html_unescape(tmp)
     return re.sub(r"\s+", " ", tmp).strip()
+
 
 def dismiss_banners(page):
     """Ferme les modales/cookies éventuelles (chaînes protégées)."""
@@ -89,6 +107,7 @@ def dismiss_banners(page):
     except Exception:
         pass
 
+
 def try_login(page, base, username, password) -> bool:
     """Se connecte si nécessaire."""
     page.goto(base + "/banque/qc/entrainement/", wait_until="domcontentloaded")
@@ -111,6 +130,7 @@ def try_login(page, base, username, password) -> bool:
     except Exception:
         return False
 
+
 def start_correction(page, base, eid) -> bool:
     """Ouvre l’épreuve et passe en mode correction."""
     page.goto(f"{base}/banque/qc/entrainement/qcmparqcm/idEpreuve={eid}", wait_until="domcontentloaded")
@@ -126,6 +146,7 @@ def start_correction(page, base, eid) -> bool:
     dismiss_banners(page)
     return True
 
+
 def extract_current(page):
     """
     Extrait la question courante et ses items (Sujet, Correction, Réponse) depuis la page de correction.
@@ -138,6 +159,7 @@ def extract_current(page):
         title_el = card.locator("div.card-title").first
         title = (title_el.text_content() or "").strip() if title_el.count() else ""
         items = []
+
         for span in card.locator("span.card-title").all():
             text = (span.text_content() or "").strip()
             if not re.match(r"^Item\s+[A-E]", text, flags=re.I):
@@ -149,6 +171,7 @@ def extract_current(page):
             cols = row.locator(":scope > div").all()
             if not cols:
                 continue
+
             sujet = corr = rep = ""
             is_true = is_false = False
 
@@ -182,11 +205,13 @@ def extract_current(page):
                 "isTrue": is_true,
                 "isFalse": is_false,
             })
+
         if items:
             return {"title": title, "items": items}
     except Exception:
         pass
     return None
+
 
 def render_pdf_html(eid: str, captured: list, mode: str) -> str:
     header = f"<h1>{'Sujet' if mode=='sujet' else 'Corrigé'} – QCM tHarmo – Épreuve {html_escape(eid)}</h1>"
@@ -208,10 +233,13 @@ h2{font-size:12pt;margin:8mm 0 4mm}
         header,
         f"<p class='muted'>Questions exportées : {len(captured)}</p>",
     ]
+
     def esc(s): return html_escape((s or ""))
+
     for i, q in enumerate(captured, start=1):
         parts.append(f"<section class='qcm'><h2>{i}. {esc(q['title'])}</h2>")
         parts.append("<div class='lines'>")
+
         for it in q["items"]:
             if mode == "sujet":
                 parts.append(f"<div class='line'><strong>{esc(it['letter'])}</strong> — {esc(it['sujet'])}</div>")
@@ -223,9 +251,12 @@ h2{font-size:12pt;margin:8mm 0 4mm}
                     f"<div class='line'><strong>{esc(it['letter'])}</strong> — {esc(it['sujet'])}"
                     f"<div class='corr'><span class='badge'>{vf}</span>{corr}{rep}</div></div>"
                 )
+
         parts.append("</div></section>")
+
     parts.append("</body></html>")
     return "".join(parts)
+
 
 def html_to_pdf_bytes(play, html: str) -> bytes:
     """Génère un PDF à partir du HTML via un contexte Playwright séparé."""
@@ -245,8 +276,46 @@ def html_to_pdf_bytes(play, html: str) -> bytes:
     finally:
         browser.close()
 
+
 # ========= Exécution =========
 if submitted:
+    # ====== MODIF : si upload HTML(s), générer 1 PDF par fichier (et ne pas exiger identifiants/IDs) ======
+    if html_files:
+        with st.spinner("Génération des PDF depuis les HTML…"):
+            try:
+                with sync_playwright() as play:
+                    for f in html_files:
+                        raw = f.read()
+                        try:
+                            html_in = raw.decode("utf-8")
+                        except Exception:
+                            html_in = raw.decode("latin-1", errors="replace")
+
+                        # 1 PDF par HTML (tel quel)
+                        try:
+                            pdf_bytes = html_to_pdf_bytes(play, html_in)
+                            base_name = re.sub(r"\.(html|htm)$", "", (f.name or "document"), flags=re.I)
+                            pdf_name = f"{base_name}.pdf"
+
+                            st.success(f"PDF généré : {pdf_name}")
+                            st.download_button(
+                                f"Télécharger {pdf_name}",
+                                data=pdf_bytes,
+                                file_name=pdf_name,
+                                mime="application/pdf",
+                                key=f"dl_{f.name}",
+                            )
+                        except Exception as e:
+                            st.error(f"Erreur PDF pour {f.name} : {e}")
+
+            except PwError as e:
+                st.error(f"Erreur Playwright : {e}")
+            except Exception as e:
+                st.error(f"Erreur inattendue : {e}")
+
+        st.stop()
+    # ================================================================================================
+
     ids = parse_ids(ids_text)
     if not username or not password or not ids:
         st.error("Renseigne identifiants + au moins un ID d’épreuve.")
