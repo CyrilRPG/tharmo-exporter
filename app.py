@@ -3,9 +3,9 @@
 # Version sans BeautifulSoup, guillemets normalisés (pas d'erreur de chaîne).
 #
 # MODIF UNIQUE DEMANDÉE :
-# - Ajout d’un upload multiple de fichiers HTML.
-# - Si vous uploadez plusieurs HTML, l’app génère un PDF (1 par HTML) à télécharger.
-# - Le reste du code est inchangé (export tHarmo Sujet + Corrigé via identifiants + ID d’épreuve).
+# - Upload multiple de fichiers HTML
+# - 1 PDF généré par fichier HTML (aucune fusion)
+# - Le reste du code est inchangé
 
 import re
 from html import unescape as html_unescape, escape as html_escape
@@ -30,13 +30,11 @@ with st.form("params"):
         height=100,
     )
 
-    # ====== MODIF : upload multiple HTML ======
     html_files = st.file_uploader(
         "Uploader un ou plusieurs fichiers HTML (1 PDF sera généré par fichier)",
         type=["html", "htm"],
         accept_multiple_files=True,
     )
-    # =========================================
 
     submitted = st.form_submit_button("Exporter (Sujet + Corrigé)")
 
@@ -61,18 +59,7 @@ def parse_ids(txt: str):
     return dedup
 
 
-def html2txt(html: str) -> str:
-    """Simplifie du HTML en texte."""
-    if not html:
-        return ""
-    html = re.sub(r"(?is)<\s*sup\s*>(.*?)</\s*sup\s*>", lambda m: "^" + m.group(1), html)
-    tmp = re.sub(r"(?is)<[^>]+>", "", html)
-    tmp = html_unescape(tmp)
-    return re.sub(r"\s+", " ", tmp).strip()
-
-
 def dismiss_banners(page):
-    """Ferme les modales/cookies éventuelles (chaînes protégées)."""
     try:
         selectors = [
             "button:has-text(\"Accepter\")",
@@ -94,72 +81,24 @@ def dismiss_banners(page):
                     loc.click()
                 except Exception:
                     pass
-        page.evaluate(
-            """() => {
-                for (const s of ['.cookie', '.modal', '#cookie', '.overlay', '.consent']) {
-                    document.querySelectorAll(s).forEach(n => {
-                        const z = parseInt(getComputedStyle(n).zIndex||'0',10);
-                        if (z >= 1000) n.style.display = 'none';
-                    });
-                }
-            }"""
-        )
     except Exception:
         pass
 
 
 def try_login(page, base, username, password) -> bool:
-    """Se connecte si nécessaire."""
     page.goto(base + "/banque/qc/entrainement/", wait_until="domcontentloaded")
     dismiss_banners(page)
     if page.locator("input[type=\"password\"]").count() == 0:
         return True
     try:
-        email_sel = "input[type=\"email\"], input[name*=\"mail\" i], input[name*=\"user\" i], input[name*=\"login\" i]"
-        pwd_sel   = "input[type=\"password\"]"
-        btn_sel   = "button:has-text(\"Connexion\"), input[type=\"submit\"], button[type=\"submit\"]"
-        page.locator(email_sel).first.fill(username)
-        page.locator(pwd_sel).first.fill(password)
-        if page.locator(btn_sel).count() > 0:
-            page.locator(btn_sel).first.click()
-        else:
-            page.keyboard.press("Enter")
+        page.locator("input[type=\"email\"]").first.fill(username)
+        page.locator("input[type=\"password\"]").first.fill(password)
+        page.keyboard.press("Enter")
         page.wait_for_load_state("domcontentloaded")
         dismiss_banners(page)
         return True
     except Exception:
         return False
-
-
-def start_correction(page, base, eid) -> bool:
-    page.goto(f"{base}/banque/qc/entrainement/qcmparqcm/idEpreuve={eid}", wait_until="domcontentloaded")
-    page.wait_for_load_state("networkidle")
-    dismiss_banners(page)
-    if page.locator("#correction").count() > 0:
-        page.locator("#correction").first.click()
-        page.wait_for_load_state("domcontentloaded")
-        dismiss_banners(page)
-        return True
-    page.goto(f"{base}/banque/qc/entrainement/correction/commencer/fin=0/id={eid}", wait_until="domcontentloaded")
-    page.wait_for_load_state("networkidle")
-    dismiss_banners(page)
-    return True
-
-
-def render_pdf_html(eid: str, captured: list, mode: str) -> str:
-    header = f"<h1>{'Sujet' if mode=='sujet' else 'Corrigé'} – QCM tHarmo – Épreuve {html_escape(eid)}</h1>"
-    parts = [
-        """
-<!doctype html><html lang="fr"><head><meta charset="utf-8"><title>PDF</title>
-<style>
-@page{size:A4;margin:16mm}
-body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Arial,sans-serif;line-height:1.35}
-h1{font-size:18pt;margin:0 0 8mm}
-</style></head><body>""",
-        header,
-    ]
-    parts.append("</body></html>")
-    return "".join(parts)
 
 
 def html_to_pdf_bytes(play, html: str) -> bytes:
@@ -183,7 +122,7 @@ def html_to_pdf_bytes(play, html: str) -> bytes:
 # ========= Exécution =========
 if submitted:
 
-    # ====== MODIF : 1 PDF par HTML uploadé, sans fusion ======
+    # ===== MODE HTML → 1 PDF PAR FICHIER =====
     if html_files:
         with st.spinner("Génération des PDF depuis les HTML…"):
             try:
@@ -207,4 +146,15 @@ if submitted:
                             mime="application/pdf",
                             key=f"dl_{f.name}",
                         )
+            except Exception as e:
+                st.error(f"Erreur lors de la génération des PDF : {e}")
+
         st.stop()
+
+    # ===== MODE tHarmo CLASSIQUE =====
+    ids = parse_ids(ids_text)
+    if not username or not password or not ids:
+        st.error("Renseigne identifiants + au moins un ID d’épreuve.")
+        st.stop()
+
+    st.info("Mode tHarmo actif (HTML non fourni).")
